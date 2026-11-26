@@ -415,7 +415,7 @@ async function collectMarket(config) {
 }
 
 function render(alert) {
-  const lines = [`【P0｜${fmtTime(alert.time)} 北京时间】${alert.title}`];
+  const lines = [`🚨【P0｜${fmtTime(alert.time)} 北京时间】${alert.title}`];
   if (alert.category) lines.push(`类型：${alert.category}${alert.china ? '｜与中国直接相关' : ''}`);
   if (alert.summary) lines.push(alert.summary);
   if (alert.link) lines.push(`来源：${alert.link}`);

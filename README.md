@@ -10,7 +10,7 @@
 │    ├─ USGS all_hour 地震          │
 │    └─ 东方财富指数跌幅            │
 │  慢环 5min（ETag 条件请求）        │
-│    └─ 中新网 ×2 / CBS / Fox / TASS│
+│    └─ 中新网 ×2 / CBS / Fox       │
 │           ↓ 命中规则 & 去重 & 冷静期 │
 │      ctx.schedule.edit(prompt)   │
 │      ctx.schedule.run(id)        │   ← 立即投递，不等下次发生时间
@@ -113,7 +113,7 @@
 | 环 | 源 | 单轮体积 |
 | --- | --- | --- |
 | 快环 | USGS `all_hour` ｜ 东方财富指数 | 3.6 KB |
-| 慢环 | 中新网 国际 / 滚动 ｜ CBS 世界 ｜ Fox 世界 ｜ TASS | 245 KB / 24 KB / 48 KB，其中 4 个支持 `ETag`/`Last-Modified`，未变更时 304 → 0 字节 |
+| 慢环 | 中新网 国际 / 滚动 ｜ CBS 世界 ｜ Fox 世界 | 245 KB / 24 KB / 10 KB / 9 KB，**全部**支持 `ETag`/`Last-Modified`，未变更时 304 → 0 字节 |
 
 `all_day`（144 KB）已从快环移除：它只比 `all_hour` 多报「一小时前已经报过」的事件，放在 45 秒循环里纯属浪费。
 
@@ -124,6 +124,7 @@
 | 新华网 RSS `news_politics.xml` | 300 条里 **0 条有 pubDate**，会把 2022 年旧文当新闻 |
 | 新浪滚动 API | 返回 2025-05-26 的旧缓存 |
 | WSJ `RSSWorldNews.xml` | 服务端给的是 2025-01-27 的静态快照 |
+| TASS `tass.com/rss/v2.xml` | 无 `ETag`/`Last-Modified`，47.9 KB 每轮全量 → 13.8 MB/天；最新条目常滞后 40 分钟以上 |
 | BBC / Al Jazeera / Google News RSS / GDELT / 财联社 / 金十 | 超时、429、404、502 |
 | 中国地震台网直连 | `ajax/google` 405、`ajax/speedsearch` TLS 失败 → 用 USGS 覆盖中国及周边 |
 
@@ -132,14 +133,14 @@
 **带宽**：原来是「每 45 秒把所有源拉一遍」，一轮约 240 KB，一天约 460 MB。现在拆成快环 / 慢环 + 条件请求，实测（`node test/smoke.mjs` 会打印这两行）：
 
 ```
-conditional GET: round1 337053 B (0/5 not modified) -> round2 47901 B (4/5 not modified)
+conditional GET: round1 288231 B (0/4 not modified) -> round2 0 B (4/4 not modified)
 ```
 
-- 慢环首轮 337 KB（含 Fox 的 245 KB），第二轮起 5 源里 4 源返回 `304`，只剩 **47.9 KB**。
-- 唯一没法缓存的是 **TASS**（既无 `ETag` 也无 `Last-Modified`，每次都是 200），48 KB × 288 轮/天 ≈ 13.8 MB。
+- 慢环首轮 288 KB（含 Fox 的 245 KB），第二轮起 4 个源全部返回 `304`，**0 字节**。
+- TASS 已于 1.0.1 移除：它既无 `ETag` 也无 `Last-Modified`，每轮都是 200 全量，独占 13.8 MB/天。
 - 快环 3.6 KB × 1920 轮/天 ≈ 6.6 MB。
 
-合计约 **20 MB/天，约为原来的 1/23**；如果愿意砍掉 TASS（最新条目常有 40 分钟以上的时滞），还能再降到 12 MB/天。
+合计约 **7–10 MB/天，约为原来的 1/50**（慢环只在内容真的变了时才下载，单个源 9–245 KB）。
 
 **token**：45 秒 tick 本身不唤醒模型、不花 token，只花带宽。一次 P0 投递才会唤醒中转会话跑一轮，实测该轮 `inputTokens ≈ 75k`（受益于 KV 缓存，重复前缀便宜）。
 

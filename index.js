@@ -335,11 +335,18 @@ async function collectNews(config, cache = {}) {
     {name: '中新网 滚动', url: 'https://www.chinanews.com.cn/rss/scroll-news.xml'},
     {name: 'CBS 世界', url: 'https://www.cbsnews.com/latest/rss/world'},
     {name: 'Fox 世界', url: 'https://moxie.foxnews.com/google-publisher/world.xml'},
-    {name: 'TASS', url: 'https://tass.com/rss/v2.xml'},
+    // TASS dropped on purpose: 47.9 KB per poll with no ETag and no
+    // Last-Modified, so conditional GET never fires — it alone cost 13.8 MB/day.
   ];
   const alerts = [];
   let notModified = 0;
   const oldest = Date.now() - config.maxNewsAgeMinutes * 60 * 1000;
+  // Drop validators of feeds that are no longer polled, so a retired source
+  // does not linger in http-cache.json forever.
+  const live = new Set(feeds.map((feed) => feed.url));
+  for (const url of Object.keys(cache)) {
+    if (!live.has(url)) delete cache[url];
+  }
   for (const feed of feeds) {
     let text;
     try {
@@ -377,7 +384,7 @@ async function collectNews(config, cache = {}) {
       });
     }
   }
-  return {alerts, notModified};
+  return {alerts, notModified, total: feeds.length};
 }
 
 async function collectMarket(config) {
@@ -495,7 +502,7 @@ export function apply(ctx, config) {
         const news = await collectNews(config, cache);
         await writeHttpCache(cache);
         alerts.push(...news.alerts);
-        newsNote = `${news.alerts.length} hit(s), ${news.notModified}/5 not modified`;
+        newsNote = `${news.alerts.length} hit(s), ${news.notModified}/${news.total} not modified`;
       }
 
       const cooldownMs = Math.max(1, config.cooldownMinutes) * 60 * 1000;

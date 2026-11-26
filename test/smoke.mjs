@@ -41,7 +41,7 @@ internals.bytes.reset();
 const second = await internals.collectNews(config, cache);
 const secondBytes = internals.bytes.value;
 console.log(
-  `conditional GET: round1 ${firstBytes} B (${first.notModified}/5 not modified) -> round2 ${secondBytes} B (${second.notModified}/5 not modified)`,
+  `conditional GET: round1 ${firstBytes} B (${first.notModified}/${first.total} not modified) -> round2 ${secondBytes} B (${second.notModified}/${second.total} not modified)`,
 );
 
 const probe = [

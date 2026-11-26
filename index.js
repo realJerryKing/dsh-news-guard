@@ -25,16 +25,21 @@ try {
 }
 
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
-const STATE_PATH = path.join(DSH_HOME, 'news-guard', 'state.json');
-const ALERT_LOG = path.join(DSH_HOME, 'news-guard', 'alerts.jsonl');
-const ALERT_DIGEST = path.join(DSH_HOME, 'news-guard', 'alerts.md');
-const PROBE_LOG_DIR = path.join(DSH_HOME, 'news-guard');
-const PROBE_LOG = path.join(DSH_HOME, 'news-guard', 'plugin.log');
-const RELAY_TASK_FILE = path.join(DSH_HOME, 'news-guard', 'relay-task.txt');
-const HTTP_CACHE = path.join(DSH_HOME, 'news-guard', 'http-cache.json');
+const DIR = path.join(DSH_HOME, 'news-guard');
+const STATE_PATH = path.join(DIR, 'state.json');
+const ALERT_LOG = path.join(DIR, 'alerts.jsonl');
+const ALERT_DIGEST = path.join(DIR, 'alerts.md');
+const PROBE_LOG = path.join(DIR, 'plugin.log');
+const RELAY_TASK_FILE = path.join(DIR, 'relay-task.txt');
+const CANDIDATE_TASK_FILE = path.join(DIR, 'candidate-task.txt');
+const HTTP_CACHE = path.join(DIR, 'http-cache.json');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const MAX_BODY_CHARS = 4_000_000;
+const MAX_TITLE = 300;
+const MAX_LINK = 500;
+const FUTURE_SKEW_MS = 15 * 60 * 1000;
 
 /** Strong, deliberately rare wordings. Ordinary market commentary must not match. */
 const KEYWORD_RULES = [
@@ -42,34 +47,57 @@ const KEYWORD_RULES = [
     category: '战争与军事冲突升级',
     re: /(宣战|开战|导弹袭击|导弹打击|空袭|地面入侵|政变|全国戒严|军事打击|核打击|核试验|击落客机|战争爆发)/,
     reEn:
-      /(declares? war|goes? to war|missile (strike|attack)|air ?strikes?|ground invasion|military coup|martial law|nuclear (strike|test)|war (has )?broken out|plane shot down|invades?)/i,
+      /(\bdeclares? war\b|\bgoes? to war\b|\bmissile (strike|attack)\b|\bair ?strikes?\b|\bground invasion\b|\bmilitary coup\b|\bmartial law\b|\bnuclear (strike|test)\b|\bwar (has )?broken out\b|\bplane shot down\b|\binvades?\b)/i,
   },
   {
     category: '恐怖袭击与重大伤亡',
     re: /(恐怖袭击|自杀式爆炸|大规模伤亡|死亡人数升至|特大事故|重大伤亡)/,
     reEn:
-      /(terror(ist)? attack|suicide bomb|mass casualties|death toll (rises|climbs|hits)|major disaster)/i,
+      /(\bterror(ist)? attack\b|\bsuicide bomb\b|\bmass casualties\b|\bdeath toll (rises|climbs|hits)\b|\bmajor disaster\b)/i,
   },
   {
     category: '重大自然灾害',
-    re: /(海啸预警|海啸警报|7\.[0-9]级地震|8\.[0-9]级地震|9\.[0-9]级地震|溃坝|核泄漏|核电站爆炸|化工园区爆炸|特大洪水)/,
+    re: /(海啸预警|海啸警报|[789]\.[0-9]\s*级地震|溃坝|核泄漏|核电站爆炸|化工园区爆炸|特大洪水)/,
     reEn:
-      /(tsunami (warning|alert)|magnitude (7|8|9)(\.\d)? (earthquake|quake)|M[789]\.\d earthquake|dam (collapse|burst)|nuclear leak|nuclear plant explosion|flash flood)/i,
+      /(\btsunami (warning|alert)\b|\bmagnitude (7|8|9)(\.\d)? (earthquake|quake)\b|\bM[789]\.\d earthquake\b|\bdam (collapse|burst)\b|\bnuclear leak\b|\bnuclear plant explosion\b|\bflash flood\b)/i,
   },
   {
     category: '金融系统性风险',
-    re: /(触发熔断|暂停交易|主权债务违约|银行挤兑|紧急降息|紧急加息|货币危机|资本管制|金融系统|全球股灾)/,
+    re: /(触发熔断|暂停交易|主权债务违约|银行挤兑|紧急降息|紧急加息|货币危机|资本管制|系统性金融风险|金融系统性风险|全球股灾)/,
     reEn:
-      /(circuit breaker|trading (halted|suspended)|sovereign default|bank run|emergency rate (cut|hike)|currency crisis|capital controls|systemic (financial|banking) (risk|crisis)|market crash)/i,
+      /(\bcircuit breaker\b|\btrading (halted|suspended)\b|\bsovereign default\b|\bbank run\b|\bemergency rate (cut|hike)\b|\bcurrency crisis\b|\bcapital controls\b|\bsystemic (financial|banking) (risk|crisis)\b|\bmarket crash\b)/i,
   },
 ];
 
-const CHINA_HINT = /(中国|北京|上海|广州|深圳|香港|台湾|南海|台海|人民币|A股|解放军|中方|China|Beijing|Shanghai|Hong Kong|Taiwan|Chinese)/i;
+/**
+ * Deliberately broader than the P0 rules: these are "worth a human look", not
+ * "wake the user". They only ever reach the judge task, which decides whether
+ * anything is actually worth broadcasting.
+ */
+const CANDIDATE_RULES = [
+  /(地震|海啸|爆炸|火灾|空难|坠机|沉船|袭击|空袭|导弹|炮击|政变|戒严|宣战|停飞停航|熔断|停牌|主权违约|资本管制|制裁|关税)/,
+  /\b(earthquake|tsunami|explosion|plane crash|air ?strike|missile|coup|martial law|circuit breaker|sovereign default|sanction|tariff|invasion)\b/i,
+];
+
+const CHINA_HINT =
+  /(中国|北京|上海|广州|深圳|香港|台湾|南海|台海|人民币|A股|解放军|中方|China|Beijing|Shanghai|Hong Kong|Taiwan|Chinese)/i;
+
+/** USGS "place" is more precise than a bounding box that also covers Japan and Korea. */
+const CHINA_PLACE =
+  /(China|Tibet|Xinjiang|Sichuan|Yunnan|Qinghai|Gansu|Shaanxi|Shanxi|Hebei|Shandong|Henan|Hubei|Hunan|Anhui|Jiangsu|Zhejiang|Fujian|Guangdong|Guangxi|Guizhou|Liaoning|Jilin|Heilongjiang|Inner Mongolia|Beijing|Tianjin|Shanghai|Chongqing|Hainan|Hong Kong|Macau|Taiwan|Nepal-India border region)/i;
 
 function matchKeyword(text) {
   for (const rule of KEYWORD_RULES) {
     const match = text.match(rule.re) ?? text.match(rule.reEn);
     if (match) return {category: rule.category, keyword: match[0]};
+  }
+  return null;
+}
+
+function matchCandidate(text) {
+  for (const re of CANDIDATE_RULES) {
+    const match = text.match(re);
+    if (match) return match[0];
   }
   return null;
 }
@@ -80,6 +108,8 @@ export const Config = Schema.object({
   enabled: Schema.boolean().default(true),
   /** Schedule task whose instruction is replaced and whose delivery is triggered per alert. */
   relayTaskId: Schema.string().default(''),
+  /** Task woken only when a candidate headline needs a human-level judgement call. */
+  candidateTaskId: Schema.string().default(''),
   /** Poll cadence for the fast, machine-checkable signals. The hard floor is 20 seconds. */
   intervalSeconds: Schema.number().default(45),
   /** News feeds change on a minutes scale, so they get their own slower cadence. */
@@ -88,13 +118,20 @@ export const Config = Schema.object({
   minMagChina: Schema.number().default(4.5),
   keywordRules: Schema.boolean().default(true),
   marketRules: Schema.boolean().default(true),
-  /** A feed item must be at most this old to qualify; prevents replaying history after downtime. */
+  /** Extra candidate scanning: wakes the judge task instead of the user. */
+  candidateRules: Schema.boolean().default(true),
+  /** Which feeds feed the candidate scanner at all. */
   maxNewsAgeMinutes: Schema.number().default(45),
-  /** Same topic stays quiet this long after it alerted once. */
+  /** Deprecated: category-level suppression dropped, it swallowed real events. Kept for compatibility. */
   cooldownMinutes: Schema.number().default(30),
   marketDropPercent: Schema.number().default(5.0),
-  /** Hard ceiling so a noisy rule can never turn into an alert storm. */
-  maxAlertsPerHour: Schema.number().default(6),
+  /** Alerts per hour (counted per alert, not per batch). */
+  maxAlertsPerHour: Schema.number().default(12),
+  /** Per message; the remainder is retried on the next tick instead of being dropped. */
+  maxAlertsPerMessage: Schema.number().default(10),
+  /** Minimum gap between candidate wakes, so a noisy day cannot turn into a chat every 45s. */
+  candidateGapMinutes: Schema.number().default(60),
+  maxCandidateWakesPerDay: Schema.number().default(6),
   /** Debug switch: push one synthetic P0 the first time a tick runs, to prove delivery works. */
   selfTest: Schema.boolean().default(false),
 });
@@ -107,7 +144,7 @@ function log(...args) {
     /* ignore */
   }
   void fs
-    .mkdir(PROBE_LOG_DIR, {recursive: true})
+    .mkdir(DIR, {recursive: true})
     .then(() => fs.appendFile(PROBE_LOG, `${new Date().toISOString()} ${line}\n`))
     .catch(() => {});
 }
@@ -120,12 +157,19 @@ function decodeEntities(value) {
     .replace(/&#39;/g, "'")
     .replace(/&apos;/g, "'")
     .replace(/&nbsp;/g, ' ')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#(\d+);/g, (whole, digits) => {
+      // An out-of-range code point throws RangeError, which used to abort the
+      // whole tick (every source, every alert) on one malformed feed item.
+      const code = Number(digits);
+      return code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
+    })
     .replace(/&amp;/g, '&');
 }
 
 function stripTags(value) {
-  return decodeEntities(String(value).replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+  return decodeEntities(String(value).replace(/<[^>]*>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function tagText(block, tag) {
@@ -140,6 +184,18 @@ function tagText(block, tag) {
 /** Bytes pulled from the network since the last reset; used to prove the diet works. */
 let bytesFetched = 0;
 
+async function readBody(response) {
+  const text = await response.text();
+  if (text.length > MAX_BODY_CHARS) throw new Error(`body too large (${text.length} chars)`);
+  bytesFetched += Buffer.byteLength(text, 'utf8');
+  return text;
+}
+
+function abandonBody(response) {
+  // A non-2xx response still holds a socket until its body is drained/cancelled.
+  void response.body?.cancel().catch(() => {});
+}
+
 async function getText(url, timeoutMs = 12000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -149,10 +205,11 @@ async function getText(url, timeoutMs = 12000) {
       signal: controller.signal,
       redirect: 'follow',
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const text = await response.text();
-    bytesFetched += text.length;
-    return text;
+    if (!response.ok) {
+      abandonBody(response);
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await readBody(response);
   } finally {
     clearTimeout(timer);
   }
@@ -172,10 +229,15 @@ async function getCached(url, cache, timeoutMs = 12000) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {headers, signal: controller.signal, redirect: 'follow'});
-    if (response.status === 304) return {status: 304, text: null};
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const text = await response.text();
-    bytesFetched += text.length;
+    if (response.status === 304) {
+      abandonBody(response);
+      return {status: 304, text: null};
+    }
+    if (!response.ok) {
+      abandonBody(response);
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const text = await readBody(response);
     const next = {};
     const etag = response.headers.get('etag');
     const lastModified = response.headers.get('last-modified');
@@ -188,31 +250,30 @@ async function getCached(url, cache, timeoutMs = 12000) {
   }
 }
 
-async function readHttpCache() {
+async function readJson(file) {
   try {
-    const raw = JSON.parse(await fs.readFile(HTTP_CACHE, 'utf8'));
-    return raw && typeof raw === 'object' ? raw : {};
+    const raw = JSON.parse(await fs.readFile(file, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : null;
   } catch {
-    return {};
+    return null;
   }
 }
 
-async function writeHttpCache(cache) {
-  try {
-    await fs.mkdir(path.dirname(HTTP_CACHE), {recursive: true});
-    await fs.writeFile(HTTP_CACHE, JSON.stringify(cache));
-  } catch {
-    /* a lost validator only costs one full fetch */
-  }
+/** Write via a temp file + rename: a crash mid-write must not leave truncated JSON. */
+async function writeJsonAtomic(file, value) {
+  await fs.mkdir(path.dirname(file), {recursive: true});
+  const temp = `${file}.tmp`;
+  await fs.writeFile(temp, JSON.stringify(value));
+  await fs.rename(temp, file);
 }
 
 function parseRss(xml, source) {
   const items = [];
   const blocks = xml.split(/<item[\s>]/i).slice(1);
   for (const block of blocks) {
-    const title = tagText(block, 'title');
+    const title = tagText(block, 'title').slice(0, MAX_TITLE);
     if (!title) continue;
-    const link = tagText(block, 'link') || tagText(block, 'guid');
+    const link = (tagText(block, 'link') || tagText(block, 'guid')).slice(0, MAX_LINK);
     const description = tagText(block, 'description');
     const published = tagText(block, 'pubDate') || tagText(block, 'dc:date');
     const time = published ? Date.parse(published) : NaN;
@@ -229,10 +290,6 @@ function parseRss(xml, source) {
   return items;
 }
 
-function chinaBox(lat, lon) {
-  return lat >= 15 && lat <= 55 && lon >= 70 && lon <= 140;
-}
-
 function fmtTime(ms) {
   const date = new Date(ms + 8 * 3600 * 1000);
   const pad = (n) => String(n).padStart(2, '0');
@@ -245,47 +302,65 @@ function fingerprint(parts) {
   return createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 16);
 }
 
-async function readState() {
+/** Same story carried by two feeds must collapse to one key. */
+function normalizeTitle(title) {
+  return String(title)
+    .toLowerCase()
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[，。！？、；：“”‘’（）《》【】…—\-.,!?;:'"()\[\]<>]/g, '');
+}
+
+function readState() {
+  // Synchronous on purpose: callers mutate and persist the returned object.
   try {
-    const raw = JSON.parse(await fs.readFile(STATE_PATH, 'utf8'));
+    const raw = JSON.parse(fsSync.readFileSync(STATE_PATH, 'utf8'));
     return {
       seen: raw.seen && typeof raw.seen === 'object' ? raw.seen : {},
-      cooldown: raw.cooldown && typeof raw.cooldown === 'object' ? raw.cooldown : {},
       sent: Array.isArray(raw.sent) ? raw.sent : [],
       primed: Boolean(raw.primed),
       relayDelivered: Number(raw.relayDelivered) || 0,
+      retryAt: Number(raw.retryAt) || 0,
+      lastCandidateAt: Number(raw.lastCandidateAt) || 0,
+      candidateDay: raw.candidateDay && typeof raw.candidateDay === 'object' ? raw.candidateDay : {},
     };
-  } catch {
-    return {seen: {}, cooldown: {}, sent: [], primed: false, relayDelivered: 0};
+  } catch (error) {
+    if (error?.code !== 'ENOENT') log('state unreadable, starting fresh', error?.message ?? String(error));
+    return {
+      seen: {},
+      sent: [],
+      primed: false,
+      relayDelivered: 0,
+      retryAt: 0,
+      lastCandidateAt: 0,
+      candidateDay: {},
+    };
   }
 }
 
 async function writeState(state) {
-  await fs.mkdir(path.dirname(STATE_PATH), {recursive: true});
   const seen = Object.entries(state.seen)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 800);
   const horizon = Date.now() - 3 * 3600 * 1000;
   const sent = (state.sent ?? []).filter((t) => t > horizon).slice(-200);
-  await fs.writeFile(
-    STATE_PATH,
-    JSON.stringify({
-      version: 1,
-      primed: state.primed,
-      seen: Object.fromEntries(seen),
-      cooldown: state.cooldown,
-      sent,
-      relayDelivered: Number(state.relayDelivered) || 0,
-    }),
-  );
+  await writeJsonAtomic(STATE_PATH, {
+    version: 2,
+    primed: state.primed,
+    seen: Object.fromEntries(seen),
+    sent,
+    relayDelivered: Number(state.relayDelivered) || 0,
+    retryAt: Number(state.retryAt) || 0,
+    lastCandidateAt: Number(state.lastCandidateAt) || 0,
+    candidateDay: state.candidateDay ?? {},
+  });
 }
 
 async function appendAlertLog(record) {
   try {
-    await fs.mkdir(path.dirname(ALERT_LOG), {recursive: true});
+    await fs.mkdir(DIR, {recursive: true});
     await fs.appendFile(ALERT_LOG, `${JSON.stringify(record)}\n`);
-  } catch {
-    /* ignore */
+  } catch (error) {
+    log('alert log write failed', error?.message ?? String(error));
   }
 }
 
@@ -318,26 +393,28 @@ async function appendDigest(record) {
       '',
       '',
     ].join('\n');
-    await fs.mkdir(path.dirname(ALERT_DIGEST), {recursive: true});
-    await fs.writeFile(ALERT_DIGEST, `${header}${kept.join('\n')}\n`);
-  } catch {
-    /* the jsonl log is the fallback */
+    await fs.mkdir(DIR, {recursive: true});
+    const temp = `${ALERT_DIGEST}.tmp`;
+    await fs.writeFile(temp, `${header}${kept.join('\n')}\n`);
+    await fs.rename(temp, ALERT_DIGEST);
+  } catch (error) {
+    log('digest write failed', error?.message ?? String(error));
   }
 }
 
-/** Feed collectors. Each returns candidate alerts; failures are isolated. */
 async function collectEarthquakes(config) {
   // all_hour is 6 KB; all_day is 144 KB and only adds what all_hour already
   // reported an hour ago, so it has no place in a 45 second loop.
   const feeds = ['https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson'];
   const alerts = [];
+  const candidates = [];
   const seenIds = new Set();
   for (const feed of feeds) {
     let payload;
     try {
       payload = JSON.parse(await getText(feed, 10000));
     } catch (error) {
-      log('usgs failed', feed, error.message);
+      log('usgs failed', feed, error?.message ?? String(error));
       continue;
     }
     for (const feature of payload.features ?? []) {
@@ -348,21 +425,28 @@ async function collectEarthquakes(config) {
       const [lon, lat] = feature.geometry?.coordinates ?? [];
       const mag = Number(props.mag);
       if (!Number.isFinite(mag)) continue;
-      const inChina = chinaBox(Number(lat), Number(lon));
-      const threshold = inChina ? config.minMagChina : config.minMagGlobal;
-      if (mag < threshold) continue;
       if (Date.now() - Number(props.time) > 6 * 3600 * 1000) continue;
-      alerts.push({
+      const place = String(props.place ?? '未知地点');
+      const inChina = CHINA_PLACE.test(place);
+      const threshold = inChina ? config.minMagChina : config.minMagGlobal;
+      const alert = {
         key: `usgs:${id}`,
         category: inChina ? '地震（中国及周边）' : '地震（全球）',
-        title: `M${mag.toFixed(1)} 地震 · ${props.place ?? '未知地点'}`,
+        title: `M${mag.toFixed(1)} 地震 · ${place}`,
         summary: `深度 ${Number(props.depth ?? feature.geometry?.coordinates?.[2] ?? 0).toFixed(0)} 公里`,
-        link: props.url ?? '',
+        link: String(props.url ?? '').slice(0, MAX_LINK),
         time: Number(props.time) || Date.now(),
-      });
+        china: inChina,
+      };
+      if (mag >= threshold) {
+        alerts.push(alert);
+      } else if (mag >= threshold - 0.7) {
+        // Just under the line: hand it to the judge task instead of the user.
+        candidates.push({...alert, key: `cand:${alert.key}`});
+      }
     }
   }
-  return alerts;
+  return {alerts, candidates};
 }
 
 async function collectNews(config, cache = {}) {
@@ -378,8 +462,10 @@ async function collectNews(config, cache = {}) {
     // Last-Modified, so conditional GET never fires — it alone cost 13.8 MB/day.
   ];
   const alerts = [];
+  const candidates = [];
   let notModified = 0;
-  const oldest = Date.now() - config.maxNewsAgeMinutes * 60 * 1000;
+  const now = Date.now();
+  const oldest = now - config.maxNewsAgeMinutes * 60 * 1000;
   // Drop validators of feeds that are no longer polled, so a retired source
   // does not linger in http-cache.json forever.
   const live = new Set(feeds.map((feed) => feed.url));
@@ -396,34 +482,59 @@ async function collectNews(config, cache = {}) {
       }
       text = response.text;
     } catch (error) {
-      log('feed failed', feed.name, error.message);
+      log('feed failed', feed.name, error?.message ?? String(error));
       continue;
     }
-    const items = parseRss(text, feed.name);
+    let items;
+    try {
+      items = parseRss(text, feed.name);
+    } catch (error) {
+      // One malformed feed must never take the whole tick down with it.
+      log('feed unparsable', feed.name, error?.message ?? String(error));
+      continue;
+    }
     const stamped = items.filter((item) => item.time !== null).length;
     if (items.length > 0 && stamped / items.length < 0.9) {
       log('feed skipped, unreliable timestamps', feed.name, `${stamped}/${items.length}`);
       continue;
     }
     for (const item of items) {
-      if (item.time === null || item.time < oldest) continue;
-      const haystack = `${item.title} ${item.summary}`;
-      const hit = matchKeyword(haystack);
-      if (!hit) continue;
-      alerts.push({
-        key: fingerprint([item.source, item.title]),
-        category: hit.category,
-        keyword: hit.keyword,
+      if (item.time === null || item.time < oldest || item.time > now + FUTURE_SKEW_MS) continue;
+      // Match the headline only: descriptions in these feeds are mostly
+      // navigation boilerplate, which used to produce alerts whose title had
+      // nothing to do with the matched keyword.
+      const hit = matchKeyword(item.title);
+      const key = fingerprint([normalizeTitle(item.title)]);
+      if (hit) {
+        alerts.push({
+          key,
+          category: hit.category,
+          keyword: hit.keyword,
+          title: item.title,
+          summary: item.summary,
+          link: item.link,
+          source: item.source,
+          time: item.time,
+          china: CHINA_HINT.test(`${item.title} ${item.summary}`),
+        });
+        continue;
+      }
+      if (!config.candidateRules) continue;
+      const candidate = matchCandidate(item.title);
+      if (!candidate) continue;
+      candidates.push({
+        key: `cand:${key}`,
+        category: `候选（${candidate}）`,
         title: item.title,
         summary: item.summary,
         link: item.link,
         source: item.source,
         time: item.time,
-        china: CHINA_HINT.test(haystack),
+        china: CHINA_HINT.test(`${item.title} ${item.summary}`),
       });
     }
   }
-  return {alerts, notModified, total: feeds.length};
+  return {alerts, candidates, notModified, total: feeds.length};
 }
 
 async function collectMarket(config) {
@@ -433,23 +544,31 @@ async function collectMarket(config) {
     const payload = JSON.parse(await getText(url, 8000));
     const rows = payload?.data?.diff ?? [];
     const alerts = [];
+    const candidates = [];
+    const day = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
     for (const row of rows) {
       const change = Number(row.f3);
       if (!Number.isFinite(change)) continue;
-      if (change > -config.marketDropPercent) continue;
-      alerts.push({
-        key: fingerprint(['market', row.f12, fmtTime(Date.now())]),
+      // Keyed by trading day, not by minute: the old key changed every minute
+      // and flooded the 800-slot dedupe map.
+      const alert = {
+        key: fingerprint(['market', String(row.f12), day, String(config.marketDropPercent)]),
         category: '金融系统性风险',
         title: `${row.f14 ?? row.f12} 单日下跌 ${Math.abs(change).toFixed(2)}%`,
         summary: `最新 ${row.f2}`,
         link: 'https://quote.eastmoney.com/',
         time: Date.now(),
-      });
+      };
+      if (change <= -config.marketDropPercent) {
+        alerts.push(alert);
+      } else if (change <= -(config.marketDropPercent * 0.6)) {
+        candidates.push({...alert, key: `cand:${alert.key}`, category: `候选（跌 ${Math.abs(change).toFixed(1)}%）`});
+      }
     }
-    return alerts;
+    return {alerts, candidates};
   } catch (error) {
-    log('market failed', error.message);
-    return [];
+    log('market failed', error?.message ?? String(error));
+    return {alerts: [], candidates: []};
   }
 }
 
@@ -461,16 +580,48 @@ function render(alert) {
   return lines.join('\n');
 }
 
+function renderCandidate(candidate) {
+  return `· ${fmtTime(candidate.time)}｜${candidate.title}｜${candidate.source ?? ''} ${candidate.link ?? ''}`.trim();
+}
+
+/**
+ * Pure decision step, so the gate logic is testable without a Host.
+ * Returns what to deliver now; anything left over stays unseen and is retried.
+ */
+export function selectDeliverable(alerts, state, config, now) {
+  const cap = Math.max(1, Number(config.maxAlertsPerHour) || 12);
+  const perMessage = Math.max(1, Number(config.maxAlertsPerMessage) || 10);
+  const recent = (state.sent ?? []).filter((t) => t > now - 3600 * 1000).length;
+  const unseen = [];
+  const seenKeys = new Set();
+  for (const alert of alerts) {
+    if (state.seen[alert.key] || seenKeys.has(alert.key)) continue;
+    seenKeys.add(alert.key);
+    unseen.push(alert);
+  }
+  unseen.sort((a, b) => b.time - a.time);
+  const slots = Math.min(cap - recent, perMessage);
+  if (slots <= 0) return {deliver: [], deferred: unseen.length, rateLimited: unseen.length > 0};
+  return {deliver: unseen.slice(0, slots), deferred: Math.max(0, unseen.length - slots), rateLimited: false};
+}
+
 export const internals = {
   collectEarthquakes,
   collectNews,
   collectMarket,
   parseRss,
   render,
+  renderCandidate,
   matchKeyword,
+  matchCandidate,
+  normalizeTitle,
+  selectDeliverable,
+  decodeEntities,
   resolveRelayTaskId,
+  resolveCandidateTaskId,
   appendDigest,
   KEYWORD_RULES,
+  CANDIDATE_RULES,
   /** Bytes counter, so the bandwidth diet is measurable from a test. */
   bytes: {
     get value() {
@@ -486,16 +637,24 @@ export const internals = {
  * Where alerts are delivered. Config wins, then an environment override, then a
  * local file — the file keeps a machine-specific task id out of version control.
  */
-function resolveRelayTaskId(config) {
-  const fromConfig = (config.relayTaskId || '').trim();
+function resolveTaskId(configured, envName, file) {
+  const fromConfig = (configured || '').trim();
   if (fromConfig) return fromConfig;
-  const fromEnv = (process.env.NEWS_GUARD_RELAY_TASK || '').trim();
+  const fromEnv = (process.env[envName] || '').trim();
   if (fromEnv) return fromEnv;
   try {
-    return fsSync.readFileSync(RELAY_TASK_FILE, 'utf8').trim();
+    return fsSync.readFileSync(file, 'utf8').trim();
   } catch {
     return '';
   }
+}
+
+function resolveRelayTaskId(config) {
+  return resolveTaskId(config.relayTaskId, 'NEWS_GUARD_RELAY_TASK', RELAY_TASK_FILE);
+}
+
+function resolveCandidateTaskId(config) {
+  return resolveTaskId(config.candidateTaskId, 'NEWS_GUARD_CANDIDATE_TASK', CANDIDATE_TASK_FILE);
 }
 
 export function apply(ctx, config) {
@@ -505,23 +664,40 @@ export function apply(ctx, config) {
   }
   const interval = Math.max(20, Number(config.intervalSeconds) || 45) * 1000;
   const newsInterval = Math.max(interval, (Number(config.newsIntervalSeconds) || 300) * 1000);
+  const candidateGap = Math.max(5, Number(config.candidateGapMinutes) || 60) * 60 * 1000;
   let lastNewsAt = 0;
   let ticks = 0;
   let busy = false;
   let disposed = false;
 
-  async function push(text) {
-    const taskId = resolveRelayTaskId(config);
+  /**
+   * Deliver through a dormant schedule task. DSH reports refusals as result
+   * objects rather than exceptions, so the codes must be checked — the old code
+   * counted `schedule_execution_pending` as a successful delivery.
+   */
+  async function deliverVia(taskId, text) {
     if (!taskId) {
-      log('no relay task configured; alert written to log only');
+      log('no task configured; not delivered');
       return false;
     }
+    const edit = await ctx.schedule.edit({id: taskId, action: 'update', patch: {prompt: text}});
+    if (edit?.code) {
+      log('delivery rejected at edit', taskId, edit.code);
+      return false;
+    }
+    const run = await ctx.schedule.run({id: taskId});
+    if (run?.code) {
+      log('delivery rejected at run', taskId, run.code);
+      return false;
+    }
+    return true;
+  }
+
+  async function push(text) {
     // The pointer rides along with every alert so that, after the relay session
     // is compacted, whoever reads it still knows where the durable record is.
     const body = `${text}\n\n📁 档案：${ALERT_DIGEST}（最近 200 条）｜原档 ${ALERT_LOG}`;
-    await ctx.schedule.edit({id: taskId, action: 'update', patch: {prompt: body}});
-    await ctx.schedule.run({id: taskId});
-    return true;
+    return deliverVia(resolveRelayTaskId(config), body);
   }
 
   async function tick() {
@@ -530,41 +706,45 @@ export function apply(ctx, config) {
     const bytesBefore = bytesFetched;
     let newsNote = 'not due';
     try {
-      const state = await readState();
+      const state = readState();
       const alerts = [];
+      const candidates = [];
       const now = Date.now();
 
-      if (config.marketRules) alerts.push(...(await collectMarket(config)));
-      alerts.push(...(await collectEarthquakes(config)));
+      if (config.marketRules) {
+        const market = await collectMarket(config);
+        alerts.push(...market.alerts);
+        candidates.push(...market.candidates);
+      }
+      const quakes = await collectEarthquakes(config);
+      alerts.push(...quakes.alerts);
+      candidates.push(...quakes.candidates);
 
       // News moves on a minutes scale; asking for it every 45 seconds is pure
       // bandwidth. It gets its own slower cadence plus conditional requests.
       if (config.keywordRules && now - lastNewsAt >= newsInterval) {
         lastNewsAt = now;
-        const cache = await readHttpCache();
-        const news = await collectNews(config, cache);
-        await writeHttpCache(cache);
-        alerts.push(...news.alerts);
-        newsNote = `${news.alerts.length} hit(s), ${news.notModified}/${news.total} not modified`;
+        const cache = (await readJson(HTTP_CACHE)) ?? {};
+        try {
+          const news = await collectNews(config, cache);
+          alerts.push(...news.alerts);
+          candidates.push(...news.candidates);
+          newsNote = `${news.alerts.length} hit(s), ${news.notModified}/${news.total} not modified`;
+        } catch (error) {
+          log('news collection failed', error?.message ?? String(error));
+          newsNote = 'failed';
+        } finally {
+          // Persist validators even if a later feed threw, so the next round
+          // does not pay for the same downloads again.
+          await writeJsonAtomic(HTTP_CACHE, cache).catch(() => {});
+        }
       }
 
-      const cooldownMs = Math.max(1, config.cooldownMinutes) * 60 * 1000;
-      const fresh = [];
-      for (const alert of alerts) {
-        if (state.seen[alert.key]) continue;
-        state.seen[alert.key] = now;
-        if (!state.primed) continue; // first run only learns what already exists
-        const cooldownKey = alert.category;
-        if ((state.cooldown[cooldownKey] ?? 0) + cooldownMs > now) continue;
-        state.cooldown[cooldownKey] = now;
-        fresh.push(alert);
-      }
-
-      const wasPrimed = state.primed;
-      state.primed = true;
-      await writeState(state);
-
-      if (!wasPrimed) {
+      if (!state.primed) {
+        // First run only learns what already exists: never replay history.
+        for (const alert of [...alerts, ...candidates]) state.seen[alert.key] = now;
+        state.primed = true;
+        await writeState(state);
         log(`primed with ${Object.keys(state.seen).length} existing items`);
         return;
       }
@@ -575,48 +755,45 @@ export function apply(ctx, config) {
         const sample = {
           category: '自检（合成告警，不是真实新闻）',
           title: '插件投递链路自检',
-          summary: `看到这条说明 P0 直推通道已打通。轮询间隔 ${interval / 1000} 秒，监控 5 个快讯源与 USGS。`,
+          summary: `看到这条说明 P0 直推通道已打通。轮询间隔 ${interval / 1000} 秒，监控 ${4} 个快讯源与 USGS。`,
           link: '',
           time: now,
           china: false,
         };
-        try {
-          await push(render(sample));
-          log('selftest delivered');
-        } catch (error) {
-          log('selftest delivery failed', error?.message ?? String(error));
+        const ok = await push(render(sample));
+        log(ok ? 'selftest delivered' : 'selftest delivery failed');
+        return;
+      }
+
+      // Do not hammer a dead relay: back off after a failure, then retry.
+      if (state.retryAt > now) {
+        newsNote = `${newsNote}; delivery backoff`;
+      } else {
+        const plan = selectDeliverable(alerts, state, config, now);
+        if (plan.rateLimited) log('rate limited', `${plan.deferred} alert(s) deferred`);
+        if (plan.deliver.length > 0) {
+          const text = plan.deliver.map(render).join('\n\n');
+          log('P0 alert', plan.deliver.map((a) => a.title).join(' / '));
+          const delivered = await push(text);
+          await appendAlertLog({at: new Date().toISOString(), delivered, alerts: plan.deliver});
+          if (delivered) {
+            for (const alert of plan.deliver) state.seen[alert.key] = now;
+            state.sent = [...(state.sent ?? []).filter((t) => t > now - 3600 * 1000), ...plan.deliver.map(() => now)];
+            state.relayDelivered = (Number(state.relayDelivered) || 0) + 1;
+            state.retryAt = 0;
+            await writeState(state);
+            log('delivered', `${plan.deliver.length} alert(s)`);
+          } else {
+            state.retryAt = now + 5 * 60 * 1000;
+            await writeState(state);
+          }
+          await appendDigest({at: new Date().toISOString(), alerts: plan.deliver, delivered});
+        } else if (plan.deferred > 0) {
+          log('alerts waiting for quota', String(plan.deferred));
         }
-        return;
       }
 
-      if (fresh.length === 0) return;
-
-      const hourAgo = now - 3600 * 1000;
-      const recent = (state.sent ?? []).filter((t) => t > hourAgo);
-      if (recent.length >= Math.max(1, config.maxAlertsPerHour)) {
-        log('rate limited', `${recent.length}/${config.maxAlertsPerHour} in the last hour`);
-        return;
-      }
-
-      fresh.sort((a, b) => b.time - a.time);
-      const text = fresh.slice(0, 3).map(render).join('\n\n');
-      log('P0 alert', fresh.map((a) => a.title).join(' / '));
-      await appendAlertLog({at: new Date().toISOString(), alerts: fresh});
-      let delivered = false;
-      try {
-        await push(text);
-        delivered = true;
-        state.sent = [...recent, now];
-        state.relayDelivered = (Number(state.relayDelivered) || 0) + 1;
-        await writeState(state);
-        log('delivered');
-      } catch (error) {
-        log('delivery failed', error?.message ?? String(error));
-      }
-      await appendDigest({at: new Date().toISOString(), alerts: fresh, delivered});
-      if (Number(state.relayDelivered) >= 200) {
-        log('relay session is getting large; rotate it', String(state.relayDelivered));
-      }
+      if (config.candidateRules) await maybeWakeJudge(candidates, state, now);
     } catch (error) {
       log('tick failed', error?.message ?? String(error));
     } finally {
@@ -628,15 +805,58 @@ export function apply(ctx, config) {
     }
   }
 
+  async function maybeWakeJudge(candidates, state, now) {
+    const fresh = [];
+    const pending = new Set();
+    for (const candidate of candidates) {
+      if (state.seen[candidate.key] || pending.has(candidate.key)) continue;
+      pending.add(candidate.key);
+      fresh.push(candidate);
+    }
+    if (fresh.length === 0) return;
+    const day = new Date(now + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    const dayState = state.candidateDay?.date === day ? state.candidateDay : {date: day, count: 0};
+    // Suppressed candidates stay unseen: they are retried once the gap or the
+    // daily budget allows, instead of being burned by a quiet hour.
+    if (now - (state.lastCandidateAt || 0) < candidateGap) return;
+    if (dayState.count >= Math.max(1, Number(config.maxCandidateWakesPerDay) || 6)) return;
+    fresh.sort((a, b) => b.time - a.time);
+    const lines = fresh.slice(0, 12).map(renderCandidate);
+    const body = [
+      '🔎 候选线索（未达标，需判断）',
+      '',
+      ...lines,
+      '',
+      fresh.length > lines.length ? `（仅列最新 ${lines.length} 条，共 ${fresh.length} 条候选）` : '',
+      '',
+      '判断规则：只有确认是重大且影响广泛的新闻才按 📰 格式播报，否则保持静默。',
+      '不要为了回应这条消息而勉强找新闻；无达标新闻时不输出任何文字。',
+      '播报后按台账格式追加到 ~/.dsh/news-guard/reported.md。',
+    ]
+      .filter(Boolean)
+      .join('\n');
+    const ok = await deliverVia(resolveCandidateTaskId(config), body);
+    if (ok) {
+      for (const candidate of fresh) state.seen[candidate.key] = now;
+      state.lastCandidateAt = now;
+      dayState.count += 1;
+      state.candidateDay = dayState;
+      await writeState(state);
+    }
+    log(ok ? 'judge woken' : 'judge delivery failed', `${fresh.length} candidate(s)`);
+  }
+
   ctx.effect(() => {
     const handle = setInterval(() => {
       void tick();
     }, interval);
+    log(
+      `started, interval ${interval / 1000}s, news every ${newsInterval / 1000}s, judge gap ${candidateGap / 60000}min`,
+    );
     void tick();
     return () => {
       disposed = true;
       clearInterval(handle);
     };
   });
-  log(`started, interval ${interval / 1000}s`);
 }

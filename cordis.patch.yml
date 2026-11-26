@@ -10,6 +10,9 @@
         # Create the task with a far-future rrule; the plugin only rewrites its
         # prompt and calls run(), so each alert lands as a fresh message at once.
         relayTaskId: ''
+        # Second task, woken only when a headline is worth a human-level call.
+        # Same resolution order, file ~/.dsh/news-guard/candidate-task.txt.
+        candidateTaskId: ''
         intervalSeconds: 45
         # News feeds move on a minutes scale and honour ETag/Last-Modified, so
         # they sit on their own slower cadence (304 costs zero bytes).
@@ -18,8 +21,15 @@
         minMagChina: 4.5
         keywordRules: true
         marketRules: true
+        # Broader scan: matches wake the judge task, never the user directly.
+        candidateRules: true
         maxNewsAgeMinutes: 45
+        # Deprecated: category-level suppression swallowed second events of the
+        # same type. Dedupe is per headline now; kept so old configs still parse.
         cooldownMinutes: 30
         marketDropPercent: 5
-        maxAlertsPerHour: 6
+        maxAlertsPerHour: 12
+        maxAlertsPerMessage: 10
+        candidateGapMinutes: 60
+        maxCandidateWakesPerDay: 6
         selfTest: false

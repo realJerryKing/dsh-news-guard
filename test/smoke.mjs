@@ -5,36 +5,35 @@ const config = {
   minMagChina: 4.5,
   maxNewsAgeMinutes: 45,
   marketDropPercent: 5,
+  candidateRules: true,
 };
 
-const budget = (label, promise) =>
-  promise.then(
-    (rows) => {
-      console.log(`--- ${label}: ${rows.length} candidate(s)`);
-      for (const row of rows.slice(0, 4)) {
-        console.log(`    [${row.category ?? row.source}] ${row.title}`);
-      }
-      return rows;
-    },
-    (error) => {
-      console.log(`--- ${label}: FAILED ${error.message}`);
-      return [];
-    },
-  );
+const show = (label, result) => {
+  const alerts = result.alerts ?? [];
+  const candidates = result.candidates ?? [];
+  console.log(`--- ${label}: ${alerts.length} alert(s), ${candidates.length} candidate(s)`);
+  for (const row of alerts.slice(0, 4)) console.log(`  [${row.category}] ${row.title}`);
+  for (const row of candidates.slice(0, 3)) console.log(`  (candidate) ${row.title}`);
+  return result;
+};
 
 const started = Date.now();
-const [quakes, news, market] = await Promise.all([
-  budget('earthquakes', internals.collectEarthquakes(config)),
-  budget('news', internals.collectNews(config, {}).then((r) => r.alerts)),
-  budget('market', internals.collectMarket(config)),
-]);
+const quakes = show('earthquakes', await internals.collectEarthquakes(config));
+const news = show('news', await internals.collectNews(config, {}));
+const market = show('market', await internals.collectMarket(config));
 console.log(`elapsed ${Date.now() - started}ms`);
-console.log('total candidates:', quakes.length + news.length + market.length);
+console.log(
+  'totals:',
+  quakes.alerts.length + news.alerts.length + market.alerts.length,
+  'alert(s),',
+  quakes.candidates.length + news.candidates.length + market.candidates.length,
+  'candidate(s)',
+);
 
 // Second round reuses the validators: a well behaved feed answers 304 and
 // costs nothing. This is what makes a 5 minute news cadence cheap.
-internals.bytes.reset();
 const cache = {};
+internals.bytes.reset();
 const first = await internals.collectNews(config, cache);
 const firstBytes = internals.bytes.value;
 internals.bytes.reset();

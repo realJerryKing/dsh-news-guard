@@ -1,10 +1,10 @@
 {
   "name": "@local/dsh-news-guard",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "Seconds-level P0 news guard: polls fast machine-checkable feeds and pushes only critical alerts into a DSH conversation.",
+  "description": "Seconds-level P0 news guard for DSH: polls fast machine-checkable feeds, pushes only critical alerts, and wakes an agent to judge borderline clues.",
   "keywords": [
     "dsh",
     "dsh-bundle",

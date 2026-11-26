@@ -5,10 +5,12 @@
 
 ```
 ┌──────────── DSH Host ────────────┐
-│  news-guard (this plugin)        │   ← apply() 起一个 setInterval，45s 一轮
-│    ├─ USGS 地震 (all_hour/day)   │
-│    ├─ 中新网 / CBS / Fox / TASS  │   ← 只保留带 pubDate 的 RSS
-│    └─ 东方财富行情 (指数跌幅)      │
+│  news-guard (this plugin)        │  ← apply() 起一个 setInterval，45s 一轮
+│  快环 45s（6 KB/轮）              │
+│    ├─ USGS all_hour 地震          │
+│    └─ 东方财富指数跌幅            │
+│  慢环 5min（ETag 条件请求）        │
+│    └─ 中新网 ×2 / CBS / Fox / TASS│
 │           ↓ 命中规则 & 去重 & 冷静期 │
 │      ctx.schedule.edit(prompt)   │
 │      ctx.schedule.run(id)        │   ← 立即投递，不等下次发生时间
@@ -84,7 +86,8 @@
 | --- | --- | --- |
 | `enabled` | `true` | 总开关 |
 | `relayTaskId` | `''` | 中转任务 id，见上 |
-| `intervalSeconds` | `45` | 轮询间隔，代码硬下限 20s |
+| `intervalSeconds` | `45` | 快环轮询间隔，代码硬下限 20s |
+| `newsIntervalSeconds` | `300` | 新闻源轮询间隔（带 ETag 条件请求） |
 | `minMagGlobal` / `minMagChina` | `6.0` / `4.5` | 全球 / 中国框内震级阈值 |
 | `keywordRules` | `true` | 是否跑关键词规则 |
 | `marketRules` | `true` | 是否跑指数跌幅规则 |
@@ -105,7 +108,14 @@
 
 详见 [`docs/measurements.md`](docs/measurements.md)。结论：
 
-**在用**：USGS `all_hour` + `all_day` ｜ 中新网 国际 / 滚动 ｜ CBS 世界 ｜ Fox 世界 ｜ TASS ｜ 东方财富指数行情。
+**在用（快环 45s / 慢环 5min）**：
+
+| 环 | 源 | 单轮体积 |
+| --- | --- | --- |
+| 快环 | USGS `all_hour` ｜ 东方财富指数 | 6 KB |
+| 慢环 | 中新网 国际 / 滚动 ｜ CBS 世界 ｜ Fox 世界 ｜ TASS | 245 KB / 24 KB / 48 KB，其中 4 个支持 `ETag`/`Last-Modified`，未变更时 304 → 0 字节 |
+
+`all_day`（144 KB）已从快环移除：它只比 `all_hour` 多报「一小时前已经报过」的事件，放在 45 秒循环里纯属浪费。
 
 **已弃用**（实测不合格）：
 
@@ -117,9 +127,21 @@
 | BBC / Al Jazeera / Google News RSS / GDELT / 财联社 / 金十 | 超时、429、404、502 |
 | 中国地震台网直连 | `ajax/google` 405、`ajax/speedsearch` TLS 失败 → 用 USGS 覆盖中国及周边 |
 
-## 成本
+## 带宽与成本
 
-一次 P0 投递 = 唤醒中转会话跑一轮。实测该轮 `inputTokens ≈ 75k`（受益于 KV 缓存，重复前缀便宜）。
+**带宽**：原来是「每 45 秒把所有源拉一遍」，一轮约 240 KB，一天约 460 MB。现在拆成快环 / 慢环 + 条件请求，实测（`node test/smoke.mjs` 会打印这两行）：
+
+```
+conditional GET: round1 337053 B (0/5 not modified) -> round2 47901 B (4/5 not modified)
+```
+
+- 慢环首轮 337 KB（含 Fox 的 245 KB），第二轮起 5 源里 4 源返回 `304`，只剩 **47.9 KB**。
+- 唯一没法缓存的是 **TASS**（既无 `ETag` 也无 `Last-Modified`，每次都是 200），48 KB × 288 轮/天 ≈ 13.8 MB。
+- 快环 6 KB × 1920 轮/天 ≈ 11.5 MB。
+
+合计约 **26 MB/天，约为原来的 1/18**；如果愿意砍掉 TASS（最新条目常有 40 分钟以上的时滞），还能再降到 12 MB/天。
+
+**token**：45 秒 tick 本身不唤醒模型、不花 token，只花带宽。一次 P0 投递才会唤醒中转会话跑一轮，实测该轮 `inputTokens ≈ 75k`（受益于 KV 缓存，重复前缀便宜）。
 
 极端情况下 6 条/小时就是 6 轮 ≈ 45 万输入 token，因此 `maxAlertsPerHour` 默认 6；把常态压到「一天几条」才是正确的手感。
 

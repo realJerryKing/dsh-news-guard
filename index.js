@@ -30,6 +30,7 @@ const ALERT_LOG = path.join(DSH_HOME, 'news-guard', 'alerts.jsonl');
 const PROBE_LOG_DIR = path.join(DSH_HOME, 'news-guard');
 const PROBE_LOG = path.join(DSH_HOME, 'news-guard', 'plugin.log');
 const RELAY_TASK_FILE = path.join(DSH_HOME, 'news-guard', 'relay-task.txt');
+const HTTP_CACHE = path.join(DSH_HOME, 'news-guard', 'http-cache.json');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -78,8 +79,10 @@ export const Config = Schema.object({
   enabled: Schema.boolean().default(true),
   /** Schedule task whose instruction is replaced and whose delivery is triggered per alert. */
   relayTaskId: Schema.string().default(''),
-  /** Poll cadence. The hard floor is 20 seconds. */
+  /** Poll cadence for the fast, machine-checkable signals. The hard floor is 20 seconds. */
   intervalSeconds: Schema.number().default(45),
+  /** News feeds change on a minutes scale, so they get their own slower cadence. */
+  newsIntervalSeconds: Schema.number().default(300),
   minMagGlobal: Schema.number().default(6.0),
   minMagChina: Schema.number().default(4.5),
   keywordRules: Schema.boolean().default(true),
@@ -133,6 +136,9 @@ function tagText(block, tag) {
   return stripTags(value);
 }
 
+/** Bytes pulled from the network since the last reset; used to prove the diet works. */
+let bytesFetched = 0;
+
 async function getText(url, timeoutMs = 12000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -143,9 +149,59 @@ async function getText(url, timeoutMs = 12000) {
       redirect: 'follow',
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.text();
+    const text = await response.text();
+    bytesFetched += text.length;
+    return text;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * Conditional GET. Feeds that honour ETag / Last-Modified answer 304 with an
+ * empty body, which is the whole point of polling a slow feed every few minutes
+ * instead of every 45 seconds.
+ */
+async function getCached(url, cache, timeoutMs = 12000) {
+  const entry = cache[url] ?? {};
+  const headers = {'user-agent': UA, accept: '*/*'};
+  if (entry.etag) headers['if-none-match'] = entry.etag;
+  if (entry.lastModified) headers['if-modified-since'] = entry.lastModified;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {headers, signal: controller.signal, redirect: 'follow'});
+    if (response.status === 304) return {status: 304, text: null};
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const text = await response.text();
+    bytesFetched += text.length;
+    const next = {};
+    const etag = response.headers.get('etag');
+    const lastModified = response.headers.get('last-modified');
+    if (etag) next.etag = etag;
+    if (lastModified) next.lastModified = lastModified;
+    cache[url] = next;
+    return {status: 200, text};
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readHttpCache() {
+  try {
+    const raw = JSON.parse(await fs.readFile(HTTP_CACHE, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeHttpCache(cache) {
+  try {
+    await fs.mkdir(path.dirname(HTTP_CACHE), {recursive: true});
+    await fs.writeFile(HTTP_CACHE, JSON.stringify(cache));
+  } catch {
+    /* a lost validator only costs one full fetch */
   }
 }
 
@@ -232,10 +288,9 @@ async function appendAlertLog(record) {
 
 /** Feed collectors. Each returns candidate alerts; failures are isolated. */
 async function collectEarthquakes(config) {
-  const feeds = [
-    'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson',
-    'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson',
-  ];
+  // all_hour is 6 KB; all_day is 144 KB and only adds what all_hour already
+  // reported an hour ago, so it has no place in a 45 second loop.
+  const feeds = ['https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson'];
   const alerts = [];
   const seenIds = new Set();
   for (const feed of feeds) {
@@ -271,7 +326,7 @@ async function collectEarthquakes(config) {
   return alerts;
 }
 
-async function collectNews(config) {
+async function collectNews(config, cache = {}) {
   // Only feeds that timestamp their items. Xinhua's category RSS carries no
   // pubDate at all (0 of 300 items), so it can neither be age-filtered nor
   // deduplicated against history without replaying old articles as new.
@@ -283,16 +338,22 @@ async function collectNews(config) {
     {name: 'TASS', url: 'https://tass.com/rss/v2.xml'},
   ];
   const alerts = [];
+  let notModified = 0;
   const oldest = Date.now() - config.maxNewsAgeMinutes * 60 * 1000;
   for (const feed of feeds) {
-    let xml;
+    let text;
     try {
-      xml = await getText(feed.url, 12000);
+      const response = await getCached(feed.url, cache, 12000);
+      if (response.status === 304) {
+        notModified += 1;
+        continue;
+      }
+      text = response.text;
     } catch (error) {
       log('feed failed', feed.name, error.message);
       continue;
     }
-    const items = parseRss(xml, feed.name);
+    const items = parseRss(text, feed.name);
     const stamped = items.filter((item) => item.time !== null).length;
     if (items.length > 0 && stamped / items.length < 0.9) {
       log('feed skipped, unreliable timestamps', feed.name, `${stamped}/${items.length}`);
@@ -316,7 +377,7 @@ async function collectNews(config) {
       });
     }
   }
-  return alerts;
+  return {alerts, notModified};
 }
 
 async function collectMarket(config) {
@@ -363,6 +424,15 @@ export const internals = {
   matchKeyword,
   resolveRelayTaskId,
   KEYWORD_RULES,
+  /** Bytes counter, so the bandwidth diet is measurable from a test. */
+  bytes: {
+    get value() {
+      return bytesFetched;
+    },
+    reset() {
+      bytesFetched = 0;
+    },
+  },
 };
 
 /**
@@ -387,6 +457,9 @@ export function apply(ctx, config) {
     return;
   }
   const interval = Math.max(20, Number(config.intervalSeconds) || 45) * 1000;
+  const newsInterval = Math.max(interval, (Number(config.newsIntervalSeconds) || 300) * 1000);
+  let lastNewsAt = 0;
+  let ticks = 0;
   let busy = false;
   let disposed = false;
 
@@ -404,16 +477,27 @@ export function apply(ctx, config) {
   async function tick() {
     if (busy || disposed) return;
     busy = true;
+    const bytesBefore = bytesFetched;
+    let newsNote = 'not due';
     try {
       const state = await readState();
       const alerts = [];
+      const now = Date.now();
 
       if (config.marketRules) alerts.push(...(await collectMarket(config)));
       alerts.push(...(await collectEarthquakes(config)));
 
-      if (config.keywordRules) alerts.push(...(await collectNews(config)));
+      // News moves on a minutes scale; asking for it every 45 seconds is pure
+      // bandwidth. It gets its own slower cadence plus conditional requests.
+      if (config.keywordRules && now - lastNewsAt >= newsInterval) {
+        lastNewsAt = now;
+        const cache = await readHttpCache();
+        const news = await collectNews(config, cache);
+        await writeHttpCache(cache);
+        alerts.push(...news.alerts);
+        newsNote = `${news.alerts.length} hit(s), ${news.notModified}/5 not modified`;
+      }
 
-      const now = Date.now();
       const cooldownMs = Math.max(1, config.cooldownMinutes) * 60 * 1000;
       const fresh = [];
       for (const alert of alerts) {
@@ -480,6 +564,10 @@ export function apply(ctx, config) {
       log('tick failed', error?.message ?? String(error));
     } finally {
       busy = false;
+      ticks += 1;
+      if (ticks % 20 === 0) {
+        log(`tick #${ticks}`, `${bytesFetched - bytesBefore} bytes`, newsNote);
+      }
     }
   }
 

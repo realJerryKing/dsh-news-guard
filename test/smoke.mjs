@@ -9,8 +9,7 @@ const config = {
 
 const budget = (label, promise) =>
   promise.then(
-    (value) => {
-      const rows = Array.isArray(value) ? value : [];
+    (rows) => {
       console.log(`--- ${label}: ${rows.length} candidate(s)`);
       for (const row of rows.slice(0, 4)) {
         console.log(`    [${row.category ?? row.source}] ${row.title}`);
@@ -26,11 +25,24 @@ const budget = (label, promise) =>
 const started = Date.now();
 const [quakes, news, market] = await Promise.all([
   budget('earthquakes', internals.collectEarthquakes(config)),
-  budget('news', internals.collectNews(config)),
+  budget('news', internals.collectNews(config, {}).then((r) => r.alerts)),
   budget('market', internals.collectMarket(config)),
 ]);
 console.log(`elapsed ${Date.now() - started}ms`);
 console.log('total candidates:', quakes.length + news.length + market.length);
+
+// Second round reuses the validators: a well behaved feed answers 304 and
+// costs nothing. This is what makes a 5 minute news cadence cheap.
+internals.bytes.reset();
+const cache = {};
+const first = await internals.collectNews(config, cache);
+const firstBytes = internals.bytes.value;
+internals.bytes.reset();
+const second = await internals.collectNews(config, cache);
+const secondBytes = internals.bytes.value;
+console.log(
+  `conditional GET: round1 ${firstBytes} B (${first.notModified}/5 not modified) -> round2 ${secondBytes} B (${second.notModified}/5 not modified)`,
+);
 
 const probe = [
   '以色列宣布对黎巴嫩开战',

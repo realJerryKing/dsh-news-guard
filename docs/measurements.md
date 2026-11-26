@@ -7,7 +7,7 @@
 | 源 | 采样 | 结论 |
 | --- | --- | --- |
 | `earthquake.usgs.gov/.../summary/all_hour.geojson` | 759 ms | ✅ 采用 |
-| `earthquake.usgs.gov/.../summary/all_day.geojson` | ✅ | ✅ 采用（补漏） |
+| `earthquake.usgs.gov/.../summary/all_day.geojson` | 144 KB | ❌ 已从快环移除（只补「一小时前已报过」的事件） |
 | 中新网 `rss/world.xml` | 214 ms | ✅ 采用 |
 | 中新网 `rss/scroll-news.xml` | 189 ms | ✅ 采用（最新条目仅 11–18 分钟前） |
 | `feeds.a.dj.com/rss/RSSWorldNews.xml` (WSJ) | 921 ms | ❌ 服务端返回 2025-01-27 静态快照 |
@@ -69,9 +69,36 @@ plugin.log        每轮的失败与投递记录（源失败、限流、投递�
 relay-task.txt    中转任务 id（不进版本库）
 ```
 
-## 四、调参经验
+## 四、体积与条件请求
+
+每个新闻源的实测体积与缓存支持（同一秒内连续两次请求，第二次带上 `If-None-Match` / `If-Modified-Since`）：
+
+| 源 | 体积 | ETag | Last-Modified | 第二次请求 |
+| --- | --- | --- | --- | --- |
+| 中新网 国际 | 9.2 KB | ✅ | ✅ | **304** |
+| 中新网 滚动 | 10.3 KB | ✅ | ✅ | **304** |
+| CBS 世界 | 24.7 KB | ❌ | ✅ | **304** |
+| Fox 世界 | **244.9 KB** | ✅ | ❌ | **304** |
+| TASS | 47.9 KB | ❌ | ❌ | 200（每次都全量） |
+
+由此做的两个决定：
+
+1. **新闻源降到 5 分钟一轮**（`newsIntervalSeconds: 300`）。这些源本身就分钟级更新，45 秒一次只是重复下载同一份 XML。
+2. **快环只留 USGS `all_hour`（6 KB）+ 行情（约 1 KB）**，`all_day` 的 144 KB 被移除。
+
+实测整轮（`node test/smoke.mjs` 打印）：
+
+```
+conditional GET: round1 337053 B (0/5 not modified) -> round2 47901 B (4/5 not modified)
+```
+
+- 首轮 337 KB 是因为 Fox 一家就 245 KB；此后每 5 分钟只剩 TASS 的 47.9 KB。
+- 一天估算：慢环 ≈ 13.8 MB（全是 TASS）+ 快环 6 KB × 1920 ≈ 11.5 MB，合计 **约 26 MB/天**，而「45 秒拉全部源」是 **约 460 MB/天**。
+
+## 五、调参经验
 
 - `intervalSeconds: 45` 是「秒级」和「别把源打疼」的折中。20s 更快，但对 TASS 这种 1.2s 才响应的源意义不大。
+- `newsIntervalSeconds: 300` 可以调到 180 换取更快的中文快讯，代价是 TASS/无缓存源多下几次；调到 600 更省，但「刚发生的空袭」可能晚 10 分钟才被看见。
 - `maxNewsAgeMinutes: 45` 决定了停机恢复后最多回放多久的旧闻；调小会更安静。
 - `cooldownMinutes: 30` 针对的是同一类别：一次海啸预警之后 30 分钟内不再重复报同类的第二条，避免一个地震把一小时的额度吃光。
 - 若发现某类总是误报，先看 `alerts.jsonl` 里的 `keyword` 字段，再决定是删词还是收窄成更长的短语——不要直接关掉整类。

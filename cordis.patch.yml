@@ -11,6 +11,9 @@
         # prompt and calls run(), so each alert lands as a fresh message at once.
         relayTaskId: ''
         intervalSeconds: 45
+        # News feeds move on a minutes scale and honour ETag/Last-Modified, so
+        # they sit on their own slower cadence (304 costs zero bytes).
+        newsIntervalSeconds: 300
         minMagGlobal: 6.0
         minMagChina: 4.5
         keywordRules: true

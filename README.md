@@ -137,6 +137,20 @@
 | BBC / Al Jazeera / Google News RSS / GDELT / 财联社 / 金十 | 超时、429、404、502 |
 | 中国地震台网直连 | `ajax/google` 405、`ajax/speedsearch` TLS 失败 → 用 USGS 覆盖中国及周边 |
 
+## 档案：为什么不能靠对话记忆
+
+投递目标是一条会话，而会话会被压缩（compact）——压缩后「发过什么」的细节可能只剩摘要。所以插件的记忆全部落在磁盘，不在上下文里：
+
+| 文件 | 内容 | 谁会读 |
+| --- | --- | --- |
+| `~/.dsh/news-guard/state.json` | 去重指纹、冷静期、每小时配额 | 插件自己 |
+| `~/.dsh/news-guard/http-cache.json` | `ETag` / `Last-Modified` 校验器 | 插件自己 |
+| `~/.dsh/news-guard/alerts.jsonl` | **机器可读权威档案**，每次命中一行 | 需要复盘/统计时 |
+| `~/.dsh/news-guard/alerts.md` | **人类可读摘要**，最近 200 条，标 ✅/⚠️ 区分是否真投递成功 | 你和 agent |
+| `~/.dsh/news-guard/reported.md` | 每小时播报的去重台账（由 agent 任务读写） | 小时级任务开工前 |
+
+每条 P0 消息末尾都会带一行 `📁 档案：…`，就是为了让「压缩后的会话」也知道去哪找真实记录。
+
 ## 带宽与成本
 
 **带宽**：原来是「每 45 秒把所有源拉一遍」，一轮约 240 KB，一天约 460 MB。现在拆成快环 / 慢环 + 条件请求，实测（`node test/smoke.mjs` 会打印这两行）：

@@ -27,6 +27,7 @@ try {
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const STATE_PATH = path.join(DSH_HOME, 'news-guard', 'state.json');
 const ALERT_LOG = path.join(DSH_HOME, 'news-guard', 'alerts.jsonl');
+const ALERT_DIGEST = path.join(DSH_HOME, 'news-guard', 'alerts.md');
 const PROBE_LOG_DIR = path.join(DSH_HOME, 'news-guard');
 const PROBE_LOG = path.join(DSH_HOME, 'news-guard', 'plugin.log');
 const RELAY_TASK_FILE = path.join(DSH_HOME, 'news-guard', 'relay-task.txt');
@@ -252,9 +253,10 @@ async function readState() {
       cooldown: raw.cooldown && typeof raw.cooldown === 'object' ? raw.cooldown : {},
       sent: Array.isArray(raw.sent) ? raw.sent : [],
       primed: Boolean(raw.primed),
+      relayDelivered: Number(raw.relayDelivered) || 0,
     };
   } catch {
-    return {seen: {}, cooldown: {}, sent: [], primed: false};
+    return {seen: {}, cooldown: {}, sent: [], primed: false, relayDelivered: 0};
   }
 }
 
@@ -273,6 +275,7 @@ async function writeState(state) {
       seen: Object.fromEntries(seen),
       cooldown: state.cooldown,
       sent,
+      relayDelivered: Number(state.relayDelivered) || 0,
     }),
   );
 }
@@ -283,6 +286,42 @@ async function appendAlertLog(record) {
     await fs.appendFile(ALERT_LOG, `${JSON.stringify(record)}\n`);
   } catch {
     /* ignore */
+  }
+}
+
+/**
+ * Human-readable mirror of alerts.jsonl. The relay conversation is only a pipe:
+ * it gets compacted when it grows, so the durable record of "what was sent" has
+ * to live on disk, not in that session's context.
+ */
+async function appendDigest(record) {
+  try {
+    const lines = (record.alerts ?? []).map((alert) => {
+      const flag = record.delivered ? '✅' : '⚠️';
+      const cn = alert.china ? '（中国相关）' : '';
+      return `- ${flag} ${fmtTime(alert.time)} P0｜${alert.title}${cn}｜${alert.category ?? ''}`;
+    });
+    if (lines.length === 0) return;
+    let kept = [];
+    try {
+      const existing = await fs.readFile(ALERT_DIGEST, 'utf8');
+      kept = existing.split('\n').filter((line) => line.startsWith('- '));
+    } catch {
+      /* first write */
+    }
+    kept = [...kept, ...lines].slice(-200);
+    const header = [
+      '# P0 告警档案',
+      '',
+      '> 由 dsh-news-guard 自动维护，最近 200 条；机器可读原档见同目录 `alerts.jsonl`。',
+      '> ✅ = 已投递到中转会话，⚠️ = 投递失败（仅留档）。',
+      '',
+      '',
+    ].join('\n');
+    await fs.mkdir(path.dirname(ALERT_DIGEST), {recursive: true});
+    await fs.writeFile(ALERT_DIGEST, `${header}${kept.join('\n')}\n`);
+  } catch {
+    /* the jsonl log is the fallback */
   }
 }
 
@@ -430,6 +469,7 @@ export const internals = {
   render,
   matchKeyword,
   resolveRelayTaskId,
+  appendDigest,
   KEYWORD_RULES,
   /** Bytes counter, so the bandwidth diet is measurable from a test. */
   bytes: {
@@ -476,7 +516,10 @@ export function apply(ctx, config) {
       log('no relay task configured; alert written to log only');
       return false;
     }
-    await ctx.schedule.edit({id: taskId, action: 'update', patch: {prompt: text}});
+    // The pointer rides along with every alert so that, after the relay session
+    // is compacted, whoever reads it still knows where the durable record is.
+    const body = `${text}\n\n📁 档案：${ALERT_DIGEST}（最近 200 条）｜原档 ${ALERT_LOG}`;
+    await ctx.schedule.edit({id: taskId, action: 'update', patch: {prompt: body}});
     await ctx.schedule.run({id: taskId});
     return true;
   }
@@ -559,13 +602,20 @@ export function apply(ctx, config) {
       const text = fresh.slice(0, 3).map(render).join('\n\n');
       log('P0 alert', fresh.map((a) => a.title).join(' / '));
       await appendAlertLog({at: new Date().toISOString(), alerts: fresh});
+      let delivered = false;
       try {
         await push(text);
+        delivered = true;
         state.sent = [...recent, now];
+        state.relayDelivered = (Number(state.relayDelivered) || 0) + 1;
         await writeState(state);
         log('delivered');
       } catch (error) {
         log('delivery failed', error?.message ?? String(error));
+      }
+      await appendDigest({at: new Date().toISOString(), alerts: fresh, delivered});
+      if (Number(state.relayDelivered) >= 200) {
+        log('relay session is getting large; rotate it', String(state.relayDelivered));
       }
     } catch (error) {
       log('tick failed', error?.message ?? String(error));

@@ -1,0 +1,22 @@
+- insert:
+    - id: news-guard
+      name: '@local/dsh-news-guard'
+      config:
+        enabled: true
+        # Delivery target. Leave empty here and put the id in ONE of:
+        #   * config.relayTaskId below (highest priority)
+        #   * env NEWS_GUARD_RELAY_TASK
+        #   * ~/.dsh/news-guard/relay-task.txt   <- keeps machine ids out of git
+        # Create the task with a far-future rrule; the plugin only rewrites its
+        # prompt and calls run(), so each alert lands as a fresh message at once.
+        relayTaskId: ''
+        intervalSeconds: 45
+        minMagGlobal: 6.0
+        minMagChina: 4.5
+        keywordRules: true
+        marketRules: true
+        maxNewsAgeMinutes: 45
+        cooldownMinutes: 30
+        marketDropPercent: 5
+        maxAlertsPerHour: 6
+        selfTest: false

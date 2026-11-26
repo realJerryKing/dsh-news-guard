@@ -1,0 +1,38 @@
+{
+  "name": "@local/dsh-news-guard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Seconds-level P0 news guard: polls fast machine-checkable feeds and pushes only critical alerts into a DSH conversation.",
+  "keywords": [
+    "dsh",
+    "dsh-bundle",
+    "deepseek-harness",
+    "news",
+    "alerting",
+    "p0"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/realJerryKing/dsh-news-guard.git"
+  },
+  "homepage": "https://github.com/realJerryKing/dsh-news-guard#readme",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
